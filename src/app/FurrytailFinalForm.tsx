@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Image from 'next/image';
 import { Fredoka, Nunito } from 'next/font/google';
 
@@ -19,13 +19,22 @@ const nunito = Nunito({
   variable: '--font-nunito',
 });
 
+// Hasil pencarian owner existing dari /api/owners/search
+interface OwnerSearchResult {
+  id: number;
+  name: string;
+  phone: string;
+}
+
 // Tipe sudah disesuaikan agar value-nya match 1:1 dengan selection options di Odoo (x_pets)
 interface PetInput {
   name: string; // -> x_name
   type: 'Anjing' | 'Kucing'; // -> x_studio_jenis_pet
   dob: string; // -> x_studio_tanggal_lahir_1
-  breed: string; // -> x_studio_ras_pet_1 (many2one ke x_ras_pet). Disimpan sebagai breedId (string id record) di form; breedLabel hanya untuk tampilan dropdown.
-  breedId: string; // id record x_ras_pet yang dipilih dari dropdown
+  breed: string; // Label tampilan breed (untuk UI saja, tidak dikirim langsung ke Odoo)
+  breedId: string; // id record x_ras_pet existing yang dipilih dari dropdown. Kosong jika pakai breedNew.
+  breedNew: string; // Nama breed baru yang diketik manual (kalau tidak ada di list) -> x_ras_pet dibuat otomatis di server
+  isAddingNewBreed: boolean; // true saat customer memilih opsi "Lainnya / Ras baru" di dropdown
   gender: 'Jantan' | 'Betina'; // -> x_studio_gender
   weight: string; // -> x_studio_berat
   vaccineStatus: 'lengkap' | 'tidak_lengkap' | 'tidak_diketahui'; // -> x_studio_status_vaksin
@@ -37,28 +46,14 @@ interface PetInput {
   allergyDetail: string; // -> field baru (text)
 }
 
-// Daftar ras sementara (idealnya di-fetch dari model x_ras_pet via JSON-RPC di Phase 3b)
+// Hasil fetch live dari /api/breeds (model x_ras_pet di Odoo)
 interface BreedOption {
   id: string;
-  label: string;
-  species: 'Anjing' | 'Kucing';
+  name: string;
 }
 
-const BREED_OPTIONS: BreedOption[] = [
-  { id: '', label: '— Pilih Ras —', species: 'Anjing' },
-  { id: '', label: '— Pilih Ras —', species: 'Kucing' },
-  { id: 'local_dog', label: 'Lokal / Kampung', species: 'Anjing' },
-  { id: 'poodle', label: 'Poodle', species: 'Anjing' },
-  { id: 'shihtzu', label: 'Shih Tzu', species: 'Anjing' },
-  { id: 'pomeranian', label: 'Pomeranian', species: 'Anjing' },
-  { id: 'golden_retriever', label: 'Golden Retriever', species: 'Anjing' },
-  { id: 'chihuahua', label: 'Chihuahua', species: 'Anjing' },
-  { id: 'local_cat', label: 'Lokal / Kampung', species: 'Kucing' },
-  { id: 'persian', label: 'Persia', species: 'Kucing' },
-  { id: 'maine_coon', label: 'Maine Coon', species: 'Kucing' },
-  { id: 'sphynx', label: 'Sphynx', species: 'Kucing' },
-  { id: 'lainnya', label: 'Lainnya', species: 'Anjing' },
-];
+// Penanda khusus untuk opsi "Lainnya / Ras baru" di dropdown breed
+const BREED_NEW_OPTION = '__new__';
 
 const emptyPet = (): PetInput => ({
   name: '',
@@ -66,6 +61,8 @@ const emptyPet = (): PetInput => ({
   dob: '',
   breed: '',
   breedId: '',
+  breedNew: '',
+  isAddingNewBreed: false,
   gender: 'Jantan',
   weight: '',
   vaccineStatus: 'tidak_diketahui',
@@ -84,6 +81,15 @@ const toFirstGroomingExperienceField = (hasGroomedBefore: PetInput['hasGroomedBe
 
 export default function FurrytailFinalForm() {
   const [lang, setLang] = useState<'id' | 'en'>('id');
+
+  // Mode customer: baru (isi semua data diri) vs lama (pilih dari owner existing)
+  const [customerMode, setCustomerMode] = useState<'baru' | 'lama'>('baru');
+  const [ownerSearchQuery, setOwnerSearchQuery] = useState('');
+  const [ownerSearchResults, setOwnerSearchResults] = useState<OwnerSearchResult[]>([]);
+  const [ownerSearchLoading, setOwnerSearchLoading] = useState(false);
+  const [selectedOwner, setSelectedOwner] = useState<OwnerSearchResult | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
   const [email, setEmail] = useState('');
@@ -93,33 +99,129 @@ export default function FurrytailFinalForm() {
 
   const [pets, setPets] = useState<PetInput[]>([emptyPet()]);
 
+  // Cache hasil fetch /api/breeds per jenis hewan, supaya tidak fetch berulang
+  // kalau ada beberapa pet dengan jenis yang sama (Anjing/Kucing).
+  const [breedCache, setBreedCache] = useState<Record<'Anjing' | 'Kucing', BreedOption[]>>({
+    Anjing: [],
+    Kucing: [],
+  });
+  const [breedLoading, setBreedLoading] = useState<Record<'Anjing' | 'Kucing', boolean>>({
+    Anjing: false,
+    Kucing: false,
+  });
+
   const [loading, setLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
+
+  // Fetch daftar breed untuk jenis hewan tertentu, sekali saja per jenis (di-cache).
+  const fetchBreeds = async (type: 'Anjing' | 'Kucing') => {
+    if (breedCache[type].length > 0 || breedLoading[type]) return;
+
+    setBreedLoading((prev) => ({ ...prev, [type]: true }));
+    try {
+      const res = await fetch(`/api/breeds?type=${encodeURIComponent(type)}`);
+      const data = await res.json();
+      setBreedCache((prev) => ({ ...prev, [type]: data.results || [] }));
+    } catch {
+      setBreedCache((prev) => ({ ...prev, [type]: [] }));
+    } finally {
+      setBreedLoading((prev) => ({ ...prev, [type]: false }));
+    }
+  };
+
+  // Fetch breed untuk jenis default (Anjing, sesuai default emptyPet) saat form pertama dimuat
+  useEffect(() => {
+    fetchBreeds('Anjing');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Debounced search ke /api/owners/search saat mode "lama" dan query >= 2 karakter
+  useEffect(() => {
+    if (customerMode !== 'lama' || selectedOwner) return;
+
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+
+    const query = ownerSearchQuery.trim();
+    if (query.length < 2) {
+      setOwnerSearchResults([]);
+      return;
+    }
+
+    debounceRef.current = setTimeout(async () => {
+      setOwnerSearchLoading(true);
+      try {
+        const res = await fetch(`/api/owners/search?q=${encodeURIComponent(query)}`);
+        const data = await res.json();
+        setOwnerSearchResults(data.results || []);
+      } catch {
+        setOwnerSearchResults([]);
+      } finally {
+        setOwnerSearchLoading(false);
+      }
+    }, 400);
+
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, [ownerSearchQuery, customerMode, selectedOwner]);
+
+  const handleSelectOwner = (owner: OwnerSearchResult) => {
+    setSelectedOwner(owner);
+    setOwnerSearchQuery(owner.name);
+    setOwnerSearchResults([]);
+  };
+
+  const handleResetOwnerSelection = () => {
+    setSelectedOwner(null);
+    setOwnerSearchQuery('');
+    setOwnerSearchResults([]);
+  };
+
+  const handleSwitchCustomerMode = (mode: 'baru' | 'lama') => {
+    setCustomerMode(mode);
+    handleResetOwnerSelection();
+  };
 
   const dict = {
     id: {
       title: 'Pendaftaran Pelanggan & Hewan Baru',
       subtitle: 'Furrytail Pet Grooming Salon & Dog Hotel',
+      customerModeLabel: 'Apakah Anda customer baru atau sudah pernah daftar?',
+      customerModeBaru: 'Customer Baru',
+      customerModeLama: 'Customer Lama',
+      ownerSearchPlaceholder: 'Ketik nama atau nomor telepon...',
+      ownerSearchLoading: 'Mencari...',
+      ownerSearchEmpty: 'Tidak ditemukan. Coba kata kunci lain.',
+      ownerSearchHint: 'Minimal 2 karakter untuk mulai mencari',
+      ownerSelectedLabel: 'Pemilik terpilih',
+      ownerChangeBtn: 'Ganti',
       ownerSection: '👤 1. Data Pemilik (Owner)',
       ownerName: 'Nama Lengkap Pemilik *',
       ownerPhone: 'No. WhatsApp / Telepon *',
       ownerEmail: 'Email',
       ownerInstagram: 'Instagram (username)',
-      addressLabel: 'Alamat Rumah *',
-      mapsLabel: 'Link Google Maps Alamat Rumah *',
+      addressLabel: 'Alamat Rumah',
+      mapsLabel: 'Link Google Maps Alamat Rumah',
       petSection: '🐾 2. Informasi Hewan Peliharaan (Pets)',
       addPetBtn: '+ Tambah Hewan',
       deletePetBtn: 'Hapus',
       petName: 'Nama Hewan *',
       petType: 'Jenis *',
+      typeAnjing: 'Anjing',
+      typeKucing: 'Kucing',
       petGender: 'Gender *',
+      genderJantan: 'Jantan',
+      genderBetina: 'Betina',
       petBreed: 'Ras Hewan *',
+      breedLoadingLabel: 'memuat...',
+      breedNewOption: '+ Ras tidak ada di daftar / tambah baru',
+      breedNewPlaceholder: 'Ketik nama ras baru *',
       petDob: 'Tanggal Lahir *',
       petWeight: 'Berat (kg) *',
       quest1: 'Apakah sudah pernah grooming sebelumnya?',
       quest2: '2. Reaksi ke orang baru?',
       quest3: 'Status Vaksin *',
-      questPhoto: 'Foto Bukti Vaksin',
+      questPhoto: 'Foto Bukti Vaksin (maks. 3MB)',
       quest5: 'Riwayat Penyakit / Catatan Khusus',
       quest4: '3. Status Alergi',
       allergyDetailLabel: 'Detail Alergi (jika ada)',
@@ -146,26 +248,42 @@ export default function FurrytailFinalForm() {
     en: {
       title: 'New Customer & Pet Registration',
       subtitle: 'Furrytail Pet Grooming Salon & Dog Hotel',
+      customerModeLabel: 'Are you a new customer or have you registered before?',
+      customerModeBaru: 'New Customer',
+      customerModeLama: 'Returning Customer',
+      ownerSearchPlaceholder: 'Type name or phone number...',
+      ownerSearchLoading: 'Searching...',
+      ownerSearchEmpty: 'No match found. Try another keyword.',
+      ownerSearchHint: 'Minimum 2 characters to start searching',
+      ownerSelectedLabel: 'Selected owner',
+      ownerChangeBtn: 'Change',
       ownerSection: '👤 1. Owner Information',
       ownerName: 'Full Name *',
       ownerPhone: 'WhatsApp / Phone *',
       ownerEmail: 'Email',
       ownerInstagram: 'Instagram (username)',
-      addressLabel: 'Home Address *',
-      mapsLabel: 'Google Maps Link *',
+      addressLabel: 'Home Address',
+      mapsLabel: 'Google Maps Link',
       petSection: '🐾 2. Pets Information',
       addPetBtn: '+ Add Pet',
       deletePetBtn: 'Remove',
       petName: 'Pet Name *',
       petType: 'Type *',
+      typeAnjing: 'Dog',
+      typeKucing: 'Cat',
       petGender: 'Gender *',
+      genderJantan: 'Male',
+      genderBetina: 'Female',
       petBreed: 'Breed *',
+      breedLoadingLabel: 'loading...',
+      breedNewOption: '+ Breed not listed / add new',
+      breedNewPlaceholder: 'Type new breed name *',
       petDob: 'Date of Birth *',
       petWeight: 'Weight (kg) *',
       quest1: 'Has this pet been groomed before?',
       quest2: '2. Reaction to strangers?',
       quest3: 'Vaccine Status *',
-      questPhoto: 'Vaccine Proof Photo',
+      questPhoto: 'Vaccine Proof Photo (max. 3MB)',
       quest5: 'Medical History / Special Notes',
       quest4: '3. Allergy Status',
       allergyDetailLabel: 'Allergy Detail (if any)',
@@ -207,30 +325,167 @@ export default function FurrytailFinalForm() {
     field: K,
     value: PetInput[K]
   ) => {
-    const newPets = [...pets];
-    newPets[index] = { ...newPets[index], [field]: value };
+    setPets((prev) => {
+      const newPets = [...prev];
+      newPets[index] = { ...newPets[index], [field]: value };
 
-    // Reset ras hewan kalau jenis pet diganti (Anjing <-> Kucing), karena daftar ras berbeda
+      // Reset ras hewan kalau jenis pet diganti (Anjing <-> Kucing), karena daftar ras berbeda
+      if (field === 'type') {
+        newPets[index].breedId = '';
+        newPets[index].breed = '';
+        newPets[index].breedNew = '';
+        newPets[index].isAddingNewBreed = false;
+      }
+
+      return newPets;
+    });
+
+    // Fetch breed untuk jenis baru kalau belum pernah di-fetch (di luar setPets,
+    // supaya tidak memicu side-effect ganda akibat React StrictMode double-invoke)
     if (field === 'type') {
-      newPets[index].breedId = '';
-      newPets[index].breed = '';
+      fetchBreeds(value as 'Anjing' | 'Kucing');
     }
-
-    setPets(newPets);
   };
 
+  // Khusus breed: breedId dan breed (label) harus di-update bersamaan dalam satu setPets,
+  // supaya tidak saling menimpa (dua panggilan handlePetChange terpisah pada event yang sama
+  // sama-sama membaca closure state lama, sehingga panggilan kedua menghapus hasil yang pertama).
+  const handleBreedChange = (index: number, breedId: string, breedLabel: string) => {
+    setPets((prev) => {
+      const newPets = [...prev];
+      newPets[index] = {
+        ...newPets[index],
+        breedId,
+        breed: breedLabel,
+        breedNew: '',
+        isAddingNewBreed: false,
+      };
+      return newPets;
+    });
+  };
+
+  // Khusus breed baru (manual): kosongkan breedId, isi breedNew, set flag isAddingNewBreed
+  const handleBreedNewChange = (index: number, value: string) => {
+    setPets((prev) => {
+      const newPets = [...prev];
+      newPets[index] = {
+        ...newPets[index],
+        breedId: '',
+        breed: '',
+        breedNew: value,
+        isAddingNewBreed: true,
+      };
+      return newPets;
+    });
+  };
+
+  // Base64 encoding menambah ~33% ukuran file. Vercel Serverless Functions (plan gratis/hobby)
+  // membatasi body request sekitar 4.5MB, jadi batas file asli di sini sengaja dijaga di bawah itu
+  // (3MB asli -> ~4MB setelah base64, masih ada margin aman).
+  const MAX_PHOTO_SIZE_BYTES = 3 * 1024 * 1024; // 3MB
+
   const handlePetFileChange = (index: number, file: File | null) => {
+    if (file && file.size > MAX_PHOTO_SIZE_BYTES) {
+      setStatusMessage(
+        lang === 'id'
+          ? '❌ Ukuran foto maksimal 3MB.'
+          : '❌ Maximum photo size is 3MB.'
+      );
+      return;
+    }
     const newPets = [...pets];
     newPets[index] = { ...newPets[index], vaccinePhoto: file };
     setPets(newPets);
   };
 
+  // Konversi File -> base64 string (tanpa prefix "data:...;base64,"), siap dikirim
+  // sebagai payload binary field x_studio_bukti_vaksin ke Odoo via JSON-RPC.
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        // result berformat "data:image/png;base64,XXXXX" -> ambil bagian setelah koma saja
+        const base64 = result.split(',')[1] ?? '';
+        resolve(base64);
+      };
+      reader.onerror = () => reject(new Error('Gagal membaca file foto.'));
+      reader.readAsDataURL(file);
+    });
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // Validasi khusus mode "lama": owner harus sudah dipilih dari search box
+    if (customerMode === 'lama' && !selectedOwner) {
+      setStatusMessage(
+        lang === 'id'
+          ? '❌ Silakan pilih nama pemilik terlebih dahulu.'
+          : '❌ Please select an owner first.'
+      );
+      return;
+    }
+
     setLoading(true);
-    // Logika kirim ke API Odoo menggunakan FormData / JSON-RPC (Phase 3b)
-    setLoading(false);
-    setStatusMessage(lang === 'id' ? '✅ Data Berhasil Disimpan!' : '✅ Data Saved Successfully!');
+    setStatusMessage('');
+
+    try {
+      // Konversi semua foto vaksin (kalau ada) ke base64 sebelum dikirim
+      const petsWithPhoto = await Promise.all(
+        pets.map(async (pet) => ({
+          ...pet,
+          vaccinePhotoBase64: pet.vaccinePhoto ? await fileToBase64(pet.vaccinePhoto) : null,
+        }))
+      );
+
+      const payload = {
+        // Mode "lama": kirim ownerId, route.ts akan skip create/dedup owner sepenuhnya.
+        // Mode "baru": ownerId tidak diikutkan, data diri di bawah ini yang dipakai.
+        ...(customerMode === 'lama' && selectedOwner ? { ownerId: selectedOwner.id } : {}),
+        fullName,
+        phone,
+        email,
+        instagram,
+        address,
+        mapLink,
+        pets: petsWithPhoto.map((pet) => ({
+          name: pet.name,
+          type: pet.type,
+          dob: pet.dob,
+          breedId: pet.breedId,
+          breedNew: pet.breedNew,
+          gender: pet.gender,
+          weight: pet.weight,
+          vaccineStatus: pet.vaccineStatus,
+          vaccinePhotoBase64: pet.vaccinePhotoBase64,
+          medicalHistory: pet.medicalHistory,
+          hasGroomedBefore: pet.hasGroomedBefore,
+          behavior: pet.behavior,
+          allergyStatus: pet.allergyStatus,
+          allergyDetail: pet.allergyDetail,
+        })),
+      };
+
+      const res = await fetch('/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const result = await res.json();
+
+      if (!res.ok) {
+        throw new Error(result.error || 'Gagal menyimpan data.');
+      }
+
+      setStatusMessage(lang === 'id' ? '✅ Data Berhasil Disimpan!' : '✅ Data Saved Successfully!');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Terjadi kesalahan tak terduga.';
+      setStatusMessage(lang === 'id' ? `❌ Gagal: ${message}` : `❌ Failed: ${message}`);
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -274,7 +529,104 @@ export default function FurrytailFinalForm() {
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-6">
+          {/* === 0. Toggle Customer Baru / Lama === */}
+          <div className="bg-[#FAF3EC] p-6 rounded-2xl">
+            <label className="text-xs font-semibold text-[#5C3A21] block mb-2">
+              {t.customerModeLabel}
+            </label>
+            <div className="flex gap-3 mb-4">
+              <button
+                type="button"
+                onClick={() => handleSwitchCustomerMode('baru')}
+                className={`flex-1 py-2 rounded-xl text-sm font-semibold border-2 ${
+                  customerMode === 'baru'
+                    ? 'bg-[#5C3A21] text-white border-[#5C3A21]'
+                    : 'bg-white text-[#5C3A21] border-[#EEDCD0]'
+                }`}
+              >
+                {t.customerModeBaru}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSwitchCustomerMode('lama')}
+                className={`flex-1 py-2 rounded-xl text-sm font-semibold border-2 ${
+                  customerMode === 'lama'
+                    ? 'bg-[#5C3A21] text-white border-[#5C3A21]'
+                    : 'bg-white text-[#5C3A21] border-[#EEDCD0]'
+                }`}
+              >
+                {t.customerModeLama}
+              </button>
+            </div>
+
+            {/* Search box: hanya muncul di mode "lama" */}
+            {customerMode === 'lama' && (
+              <div>
+                {selectedOwner ? (
+                  <div className="flex items-center justify-between bg-white border border-[#EEDCD0] rounded-xl p-3">
+                    <div>
+                      <p className="text-xs text-[#8a6f5a]">{t.ownerSelectedLabel}</p>
+                      <p className="text-sm font-semibold text-[#5C3A21]">
+                        {selectedOwner.name}{' '}
+                        <span className="font-normal text-[#8a6f5a]">
+                          ({selectedOwner.phone})
+                        </span>
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleResetOwnerSelection}
+                      className="text-xs text-red-600 underline whitespace-nowrap ml-3"
+                    >
+                      {t.ownerChangeBtn}
+                    </button>
+                  </div>
+                ) : (
+                  <div className="relative">
+                    <input
+                      type="text"
+                      placeholder={t.ownerSearchPlaceholder}
+                      value={ownerSearchQuery}
+                      onChange={(e) => setOwnerSearchQuery(e.target.value)}
+                      className="w-full p-3 rounded-xl border"
+                    />
+                    {ownerSearchQuery.trim().length > 0 &&
+                      ownerSearchQuery.trim().length < 2 && (
+                        <p className="text-xs text-[#8a6f5a] mt-1">{t.ownerSearchHint}</p>
+                      )}
+                    {ownerSearchLoading && (
+                      <p className="text-xs text-[#8a6f5a] mt-1">{t.ownerSearchLoading}</p>
+                    )}
+                    {!ownerSearchLoading &&
+                      ownerSearchQuery.trim().length >= 2 &&
+                      ownerSearchResults.length === 0 && (
+                        <p className="text-xs text-[#8a6f5a] mt-1">{t.ownerSearchEmpty}</p>
+                      )}
+                    {ownerSearchResults.length > 0 && (
+                      <div className="absolute z-10 mt-1 w-full bg-white border border-[#EEDCD0] rounded-xl shadow-lg overflow-hidden">
+                        {ownerSearchResults.map((owner) => (
+                          <button
+                            type="button"
+                            key={owner.id}
+                            onClick={() => handleSelectOwner(owner)}
+                            className="w-full text-left px-3 py-2 text-sm hover:bg-[#FAF3EC] border-b border-[#EEDCD0] last:border-b-0"
+                          >
+                            <span className="font-semibold text-[#5C3A21]">{owner.name}</span>{' '}
+                            <span className="text-[#8a6f5a]">({owner.phone})</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* === 1. Data Pemilik === */}
+          {/* Hanya tampil untuk customer baru. Customer lama: data sudah ada di Odoo,
+              cukup pilih lewat search box di atas. */}
+          {customerMode === 'baru' && (
           <div className="bg-[#FAF3EC] p-6 rounded-2xl">
             <h2
               className="text-base font-semibold text-[#5C3A21] mb-4"
@@ -315,7 +667,6 @@ export default function FurrytailFinalForm() {
               />
               <textarea
                 placeholder={t.addressLabel}
-                required
                 value={address}
                 className="w-full p-3 rounded-xl border md:col-span-2"
                 onChange={(e) => setAddress(e.target.value)}
@@ -323,13 +674,13 @@ export default function FurrytailFinalForm() {
               <input
                 type="url"
                 placeholder={t.mapsLabel}
-                required
                 value={mapLink}
                 className="w-full p-3 rounded-xl border md:col-span-2"
                 onChange={(e) => setMapLink(e.target.value)}
               />
             </div>
           </div>
+          )}
 
           {/* === 2. Informasi Hewan === */}
           <div>
@@ -350,7 +701,7 @@ export default function FurrytailFinalForm() {
             </div>
 
             {pets.map((pet, idx) => {
-              const breedChoices = BREED_OPTIONS.filter((b) => b.species === pet.type);
+              const breedChoices = breedCache[pet.type];
 
               return (
                 <div
@@ -390,8 +741,8 @@ export default function FurrytailFinalForm() {
                         handlePetChange(idx, 'type', e.target.value as PetInput['type'])
                       }
                     >
-                      <option value="Anjing">Anjing</option>
-                      <option value="Kucing">Kucing</option>
+                      <option value="Anjing">{t.typeAnjing}</option>
+                      <option value="Kucing">{t.typeKucing}</option>
                     </select>
 
                     <select
@@ -401,30 +752,51 @@ export default function FurrytailFinalForm() {
                         handlePetChange(idx, 'gender', e.target.value as PetInput['gender'])
                       }
                     >
-                      <option value="Jantan">Jantan</option>
-                      <option value="Betina">Betina</option>
+                      <option value="Jantan">{t.genderJantan}</option>
+                      <option value="Betina">{t.genderBetina}</option>
                     </select>
 
-                    {/* Ras: dropdown, sesuai x_studio_ras_pet_1 (many2one -> x_ras_pet) */}
-                    <select
-                      value={pet.breedId}
-                      required
-                      className="p-2 border rounded-lg"
-                      onChange={(e) => {
-                        const selected = breedChoices.find((b) => b.id === e.target.value);
-                        handlePetChange(idx, 'breedId', e.target.value);
-                        handlePetChange(idx, 'breed', selected?.label ?? '');
-                      }}
-                    >
-                      <option value="">— {t.petBreed} —</option>
-                      {breedChoices
-                        .filter((b) => b.id !== '')
-                        .map((b) => (
+                    {/* Ras: dropdown live dari x_ras_pet, + opsi ketik ras baru kalau tidak ada di list */}
+                    <div>
+                      <select
+                        value={pet.isAddingNewBreed ? BREED_NEW_OPTION : pet.breedId}
+                        required={!pet.isAddingNewBreed}
+                        className="p-2 border rounded-lg w-full"
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (val === BREED_NEW_OPTION) {
+                            handleBreedNewChange(idx, '');
+                            return;
+                          }
+                          const selected = breedChoices.find((b) => b.id === val);
+                          handleBreedChange(idx, val, selected?.name ?? '');
+                        }}
+                      >
+                        <option value="">
+                          {breedLoading[pet.type]
+                            ? `${t.petBreed} (${t.breedLoadingLabel})`
+                            : `— ${t.petBreed} —`}
+                        </option>
+                        {breedChoices.map((b) => (
                           <option key={b.id} value={b.id}>
-                            {b.label}
+                            {b.name}
                           </option>
                         ))}
-                    </select>
+                        <option value={BREED_NEW_OPTION}>{t.breedNewOption}</option>
+                      </select>
+
+                      {/* Text input muncul hanya saat customer pilih opsi "ras baru" */}
+                      {pet.isAddingNewBreed && (
+                        <input
+                          type="text"
+                          placeholder={t.breedNewPlaceholder}
+                          required
+                          value={pet.breedNew}
+                          className="p-2 border rounded-lg w-full mt-2"
+                          onChange={(e) => handleBreedNewChange(idx, e.target.value)}
+                        />
+                      )}
+                    </div>
 
                     <input
                       type="date"
@@ -600,7 +972,13 @@ export default function FurrytailFinalForm() {
           </button>
 
           {statusMessage && (
-            <p className="text-center text-sm font-semibold text-green-700">{statusMessage}</p>
+            <p
+              className={`text-center text-sm font-semibold ${
+                statusMessage.startsWith('❌') ? 'text-red-600' : 'text-green-700'
+              }`}
+            >
+              {statusMessage}
+            </p>
           )}
         </form>
       </div>
